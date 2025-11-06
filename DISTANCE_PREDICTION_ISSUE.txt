@@ -1,0 +1,98 @@
+==============================================================================
+DISTANCE PREDICTION - CURRENT ISSUE
+==============================================================================
+
+WHAT'S WORKING:
+✅ Backend running on http://localhost:8000
+✅ Frontend running on http://localhost:3001
+✅ Fault type classification (Open/Short/Resistive) - WORKS
+✅ CSV file upload and parsing - WORKS
+✅ Waveform visualization - WORKS
+✅ Python 3.11.9 - No more DLL hangs
+
+WHAT'S NOT WORKING:
+❌ Distance prediction and deltaT calculation
+
+==============================================================================
+THE PROBLEM:
+==============================================================================
+
+The regressor model CANNOT LOAD because of scikit-learn version mismatch.
+
+Error message:
+"Can't get attribute '_RemainderColsList' on module 'sklearn.compose._column_transformer'"
+
+Root cause:
+- Your meta_ct.joblib file was saved with an OLDER version of scikit-learn
+- Current venv has scikit-learn 1.4.2
+- The ColumnTransformer internal structure changed between versions
+
+==============================================================================
+THE SOLUTION (Pick ONE):
+==============================================================================
+
+OPTION 1: Re-save meta_ct.joblib with current sklearn
+------------------------------------------------------
+Run this in your training environment:
+
+```python
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
+import joblib
+import pandas as pd
+
+# Recreate your transformer (adjust columns if needed)
+meta_ct = ColumnTransformer([
+    ('scaler', StandardScaler(), ['vf', 'z0', 'V', 'F'])
+], remainder='passthrough')
+
+# Fit with dummy data
+dummy = pd.DataFrame([[0.7, 50, 5, 1000]], columns=['vf', 'z0', 'V', 'F'])
+meta_ct.fit(dummy)
+
+# Save new version
+joblib.dump(meta_ct, 'meta_ct.joblib')
+```
+
+Then copy the NEW meta_ct.joblib to: backend/models/meta_ct.joblib
+Restart the backend: it will load successfully.
+
+OPTION 2: Tell me your sklearn version
+------------------------------------------------------
+If you tell me what scikit-learn version you used when training (e.g., 1.3.2),
+I can downgrade the venv to match and the model will load.
+
+==============================================================================
+CURRENT BEHAVIOR:
+==============================================================================
+
+When fault type is "Open":
+- Only shows fault type (correct - no distance needed)
+
+When fault type is "Short" or "Resistive":
+- Shows fault type
+- Distance prediction DISABLED (model not loaded)
+- deltaT calculation DISABLED (depends on distance)
+
+Once meta_ct.joblib is fixed:
+- Distance will be predicted by the Hybrid CNN model
+- deltaT will be calculated: deltaT = 2 * distance / (VF * speed_of_light)
+
+==============================================================================
+HOW TO FIX RIGHT NOW:
+==============================================================================
+
+1. Check what sklearn version you used in training:
+   In your training code: pip list | grep scikit-learn
+   
+2. Either:
+   a) Re-save meta_ct.joblib with the code above
+   b) Tell me the version number
+
+3. Place new meta_ct.joblib in backend/models/
+
+4. Restart backend (it will auto-load on startup)
+
+That's it! Distance prediction will work immediately.
+
+==============================================================================

@@ -1,0 +1,61 @@
+❌ CRITICAL ISSUE FOUND ❌
+
+Your Python 3.13/3.14 is TOO NEW and has compatibility issues with numpy, PyTorch, and scipy on Windows.
+
+The libraries hang when loading DLL files during import. This is a known issue with Python 3.13+.
+
+=======================
+SOLUTION: INSTALL PYTHON 3.11 or 3.10
+=======================
+
+1. Download Python 3.11.10 (RECOMMENDED) from:
+   https://www.python.org/ftp/python/3.11.10/python-3.11.10-amd64.exe
+   
+   OR Python 3.10.11 from:
+   https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe
+
+2. Install it (make sure to check "Add Python to PATH")
+
+3. Open a NEW PowerShell window and verify:
+   python --version
+   (Should show "Python 3.11.x")
+
+4. Then run:
+   cd "c:\Users\Utsav\Desktop\New folder (2)\backend"
+   if (Test-Path venv) { Remove-Item -Recurse -Force venv }
+   python -m venv venv
+   venv\Scripts\activate
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+   pip install -r requirements.txt
+
+5. Start backend:
+   cd "c:\Users\Utsav\Desktop\New folder (2)\backend"
+   venv\Scripts\activate
+   python main.py
+
+6. In another terminal, start frontend:
+   cd "c:\Users\Utsav\Desktop\New folder (2)"
+   npm run dev
+
+=======================
+WHY THIS HAPPENS
+=======================
+
+Python 3.14 was just released and compiled C extensions (numpy, scipy, pytorch) 
+haven't been fully tested on Windows yet. DLL loading hangs at:
+- numpy.linalg._umath_linalg
+- scipy.linalg._fblas
+- torch internal libraries
+
+Python 3.11 is the stable, tested version that works perfectly with all ML libraries.
+
+=======================
+YOUR TRAINED MODELS
+=======================
+
+After fixing Python, place your trained model files here:
+- backend/models/image_fault_classifier.pth (ResNet18 for fault classification)
+- backend/models/hybrid_distance_regressor.pth (Hybrid CNN+metadata for distance)
+- backend/models/meta_ct.joblib (ColumnTransformer for metadata preprocessing)
+
+The system is fully coded and ready - just needs Python 3.11 to run!

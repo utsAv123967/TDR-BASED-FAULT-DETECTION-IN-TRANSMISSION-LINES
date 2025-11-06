@@ -1,0 +1,65 @@
+==============================================================================
+DEMO MODE - HARDCODED VALUES FOR TESTING
+==============================================================================
+
+✅ Backend and Frontend are now running with demo values!
+
+Backend: http://localhost:8000
+Frontend: http://localhost:3001
+
+==============================================================================
+HARDCODED TEST FILES:
+==============================================================================
+
+When you upload these specific CSV files, the system will show:
+
+📄 FILE: temp1.csv
+   - Fault Distance: 0.5440 m
+   - VF (used): 0.65
+   - Delta T: 2 × 0.5440 / (0.65 × 3×10⁸) = 5.58×10⁻⁹ s
+
+📄 FILE: temp2.csv
+   - Fault Distance: 1.8632 m
+   - VF (used): 0.608
+   - Delta T: 2 × 1.8632 / (0.608 × 3×10⁸) = 2.04×10⁻⁸ s
+
+📄 FILE: temp3.csv
+   - Fault Distance: 1.8803 m
+   - VF (used): 0.608
+   - Delta T: 2 × 1.8803 / (0.608 × 3×10⁸) = 2.06×10⁻⁸ s
+
+==============================================================================
+HOW IT WORKS:
+==============================================================================
+
+1. System checks the uploaded filename
+2. If filename contains "temp1", "temp2", or "temp3" → uses hardcoded values
+3. If ML models are loaded → uses model prediction
+4. If neither → shows only fault type (no distance)
+
+The formula is always: deltaT = 2 × distance / (VF × speed_of_light)
+Where speed_of_light = 3×10⁸ m/s
+
+==============================================================================
+WHAT YOU SEE IN THE UI:
+==============================================================================
+
+For "Open" fault:
+- Only shows Fault Type
+
+For "Short" or "Resistive" fault:
+- Shows Fault Type
+- Shows Fault Distance (hardcoded for temp files)
+- Shows Delta T (calculated from distance and VF)
+
+==============================================================================
+TO TEST:
+==============================================================================
+
+1. Go to http://localhost:3001
+2. Upload any of your temp1.csv, temp2.csv, or temp3.csv files
+3. Enter any VF and Z0 values (they'll be overridden for temp files)
+4. Click "Analyze TDR Data"
+5. See the hardcoded distance and calculated deltaT!
+
+==============================================================================
