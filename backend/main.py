@@ -1,5 +1,5 @@
-# TDR Cable Fault Detection - FastAPI Backend with PyTorch Models
-# This backend integrates your trained ResNet18 classifier and Hybrid distance regressor
+# TDR Cable Fault Classification - Simplified Backend
+# This backend only performs fault classification using ResNet18
 
 import os
 import sys
@@ -21,9 +21,16 @@ import matplotlib.pyplot as plt
 from io import BytesIO, StringIO
 import base64
 
-# Simple smoothing function (replaces scipy.signal.savgol_filter)
+# Preprocessing matching training code
+try:
+    from scipy.signal import savgol_filter
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+    print("Warning: scipy not installed, using simple smoothing")
+
 def simple_smooth(data, window_size=5):
-    """Simple moving average smoothing"""
+    """Simple moving average smoothing (fallback)"""
     if len(data) < window_size:
         return data
     smoothed = np.copy(data).astype(float)
@@ -32,6 +39,21 @@ def simple_smooth(data, window_size=5):
         end = min(len(data), i + window_size // 2 + 1)
         smoothed[i] = np.mean(data[start:end])
     return smoothed
+
+def preprocess_voltage(voltage):
+    """Preprocess voltage data matching training code"""
+    # Apply Savitzky-Golay filter if available (same as training)
+    if HAS_SCIPY and len(voltage) > 50:
+        v = savgol_filter(voltage, 51, 3)
+    else:
+        v = voltage.copy()
+    
+    # Normalize: center and scale (same as training)
+    v = v - np.mean(v)
+    vmax = np.max(np.abs(v)) + 1e-9
+    v = v / vmax
+    
+    return v
 
 # PyTorch imports - lazy load to avoid hangs
 import torch
@@ -47,20 +69,7 @@ def lazy_import_torchvision():
         transforms = tv_transforms
         resnet18 = tv_resnet18
 
-# Sklearn imports - lazy load to avoid scipy hang
-import joblib
-ColumnTransformer = None
-StandardScaler = None
-
-def lazy_import_sklearn():
-    global ColumnTransformer, StandardScaler
-    if ColumnTransformer is None:
-        from sklearn.compose import ColumnTransformer as CT
-        from sklearn.preprocessing import StandardScaler as SS
-        ColumnTransformer = CT
-        StandardScaler = SS
-
-app = FastAPI(title="TDR Cable Fault Detection API")
+app = FastAPI(title="TDR Fault Classification API")
 
 # CORS
 app.add_middleware(
@@ -74,310 +83,468 @@ app.add_middleware(
 # Global variables for models
 device = "cuda" if torch.cuda.is_available() else "cpu"
 classifier_model = None
-regressor_model = None
+distance_regressor = None
 meta_ct = None
 
-# ============================================================================
-# MODEL DEFINITIONS
-# ============================================================================
-
-class HybridRegressor(nn.Module):
-    """Hybrid CNN + Metadata model for distance prediction"""
-    def __init__(self, meta_dim):
-        super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv1d(1, 32, 7, padding=3), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, 5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(64, 128, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1)
-        )
-        self.head = nn.Sequential(
-            nn.Linear(128 + meta_dim, 64), nn.ReLU(),
-            nn.Linear(64, 1), nn.ReLU()
-        )
-
-    def forward(self, x_sig, x_meta):
-        f = self.cnn(x_sig).squeeze(-1)
-        z = torch.cat([f, x_meta], dim=1)
-        return self.head(z).squeeze(1)
+# Class names for classification
+CLASS_NAMES = ['No Fault (Open)', 'Short Circuit', 'Resistive Fault']
 
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
 def clean_and_load_csv(file_content):
-    """Parse CSV content from uploaded file"""
+    """Parse CSV content matching training code logic"""
     try:
-        lines = file_content.decode('utf-8').strip().split('\n')
+        raw = file_content.decode('utf-8').split('\n')
         cleaned = []
-        for line in lines:
+        
+        for line in raw:
             s = line.strip()
-            if not s or s.startswith(",CH") or s.lower().startswith("second,") or s.lower().startswith("time,"):
+            if not s:
                 continue
-            cleaned.append(s.rstrip(","))
+            # Skip headers like ",CH1" or "Second,Volt" or "Time,Voltage"
+            if s.startswith(",CH") or s.lower().startswith("second,") or s.lower().startswith("time,"):
+                continue
+            # Remove trailing commas
+            s = s.rstrip(",")
+            cleaned.append(s)
         
         if len(cleaned) < 5:
-            return None, None
+            raise ValueError("Not enough data rows")
         
+        # Parse as Time,Voltage CSV
         df = pd.read_csv(StringIO("\n".join(cleaned)), header=None, names=["Time", "Voltage"])
-        t = pd.to_numeric(df["Time"], errors="coerce")
-        v = pd.to_numeric(df["Voltage"], errors="coerce")
-        mask = (~t.isna()) & (~v.isna())
-        t, v = t[mask].values, v[mask].values
+        time = pd.to_numeric(df["Time"], errors="coerce")
+        voltage = pd.to_numeric(df["Voltage"], errors="coerce")
         
-        return (t, v) if len(t) >= 8 else (None, None)
+        # Remove NaN values
+        mask = (~time.isna()) & (~voltage.isna())
+        time = time[mask].values
+        voltage = voltage[mask].values
+        
+        if len(time) < 8:
+            raise ValueError("Insufficient valid data points")
+        
+        return time, voltage
+        
     except Exception as e:
-        print(f"CSV parsing error: {e}")
-        return None, None
+        raise ValueError(f"Error parsing CSV file: {str(e)}")
 
-def csv_to_image(time, voltage, img_size=224):
-    """Convert waveform to 224x224 image for CNN"""
+def csv_to_image(time, voltage, target_size=(224, 224)):
+    """Convert voltage data to image matching training code"""
     try:
-        if len(voltage) > 50:
-            voltage = simple_smooth(voltage, window_size=min(51, len(voltage) // 2))
+        # Preprocess voltage (normalize like training)
+        v_processed = preprocess_voltage(voltage)
         
-        voltage = voltage - np.mean(voltage)
-        voltage = voltage / (np.max(np.abs(voltage)) + 1e-9)
-
-        fig = plt.figure(figsize=(3, 3), dpi=img_size // 3)
-        ax = plt.axes([0, 0, 1, 1])
-        ax.plot(time, voltage, linewidth=2, color='blue')
-        ax.set_axis_off()
+        # Extract size (handle both int and tuple)
+        img_size = target_size[0] if isinstance(target_size, tuple) else target_size
         
+        # Create plot on WHITE background (same as training)
+        fig = plt.figure(figsize=(3, 3), dpi=img_size//3)
+        ax = plt.axes([0, 0, 1, 1])  # Full canvas, no margins
+        
+        # Plot waveform
+        ax.plot(time, v_processed, linewidth=2)
+        ax.set_axis_off()  # No axes (same as training)
+        
+        # Save to buffer
         buf = BytesIO()
-        fig.savefig(buf, format='png', dpi=img_size // 3, bbox_inches='tight', pad_inches=0)
+        plt.savefig(buf, format='png', dpi=img_size//3)
         plt.close(fig)
         buf.seek(0)
         
-        img = Image.open(buf).convert("RGB").resize((img_size, img_size), Image.BICUBIC)
+        # Load as PIL Image and resize to exact size
+        img = Image.open(buf).convert('RGB')
+        img = img.resize(target_size if isinstance(target_size, tuple) else (target_size, target_size), Image.BICUBIC)
+        
         return img
     except Exception as e:
-        print(f"Image creation error: {e}")
+        raise ValueError(f"Error converting CSV to image: {str(e)}")
+
+def get_plot_base64(time, voltage):
+    """Generate detailed plot for frontend display - dark purple theme with data points"""
+    try:
+        # Apply smoothing for cleaner plot
+        if HAS_SCIPY and len(voltage) > 50:
+            v_smooth = savgol_filter(voltage, 51, 3)
+        else:
+            v_smooth = simple_smooth(voltage, window_size=5)
+        
+        # Create plot with dark purple background
+        fig, ax = plt.subplots(figsize=(12, 5), facecolor='#2d1b4e')
+        ax.set_facecolor('#2d1b4e')
+        
+        # Convert time to nanoseconds for better readability
+        time_ns = time * 1e9
+        
+        # Plot the actual data points with markers
+        ax.plot(time_ns, voltage, color='#3b9eff', linewidth=1.5, 
+                marker='o', markersize=3, markerfacecolor='#3b9eff', 
+                markeredgecolor='#ffffff', markeredgewidth=0.5,
+                label='Voltage', alpha=0.9)
+        
+        # Styling to match the reference image
+        ax.set_xlabel('Time (ns)', fontsize=12, color='white', fontweight='bold')
+        ax.set_ylabel('Voltage (V)', fontsize=12, color='white', fontweight='bold')
+        ax.set_title('Waveform Visualization', fontsize=14, color='white', fontweight='bold', pad=20)
+        
+        # Style the legend
+        legend = ax.legend(loc='upper right', facecolor='#2d1b4e', edgecolor='#3b9eff', 
+                          framealpha=0.8, fontsize=10)
+        plt.setp(legend.get_texts(), color='#3b9eff')
+        
+        # Customize grid
+        ax.grid(True, alpha=0.2, color='white', linestyle='-', linewidth=0.5)
+        
+        # Customize tick colors
+        ax.tick_params(axis='x', colors='white', labelsize=10)
+        ax.tick_params(axis='y', colors='white', labelsize=10)
+        
+        # Customize spines
+        for spine in ax.spines.values():
+            spine.set_color('white')
+            spine.set_linewidth(1)
+        
+        plt.tight_layout()
+        
+        buf = BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=100, facecolor='#2d1b4e')
+        plt.close(fig)
+        buf.seek(0)
+        
+        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        return f"data:image/png;base64,{img_base64}"
+    except Exception as e:
+        print(f"Error generating plot: {e}")
         return None
 
-def image_to_base64(image):
-    """Convert PIL Image to base64 string"""
-    buffered = BytesIO()
-    image.save(buffered, format="PNG")
-    return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
-
-def process_waveform(time, voltage, target_length=2048):
-    """Process waveform for regression model"""
-    try:
-        if len(voltage) > 50:
-            voltage = simple_smooth(voltage, window_size=min(51, len(voltage) // 2))
-        
-        voltage = voltage - np.mean(voltage)
-        voltage = voltage / (np.max(np.abs(voltage)) + 1e-6)
-        
-        t_new = np.linspace(time[0], time[-1], target_length)
-        voltage = np.interp(t_new, time, voltage)
-        
-        return voltage.astype(np.float32)
-    except Exception as e:
-        print(f"Waveform processing error: {e}")
-        return np.zeros(target_length, dtype=np.float32)
-
 # ============================================================================
-# STARTUP: LOAD MODELS
+# MODEL LOADING
 # ============================================================================
 
-@app.on_event("startup")
-async def load_models():
-    """Load trained models on startup"""
-    global classifier_model, regressor_model, meta_ct
+def load_classifier_model():
+    """Load the fault classification model (ResNet18)"""
+    global classifier_model
     
     try:
-        lazy_import_torchvision()  # Import torchvision after startup
-        lazy_import_sklearn()      # Import sklearn after startup
+        lazy_import_torchvision()
         
-        # Load classifier
-        classifier_model = resnet18(weights=None, num_classes=3).to(device)
-        classifier_model.load_state_dict(
-            torch.load("models/image_fault_classifier.pth", map_location=device, weights_only=False)
-        )
-        classifier_model.eval()
-        print("✓ Classifier model loaded")
+        model_path = os.path.join('models', 'image_fault_classifier.pth')
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Classifier model not found at {model_path}")
+        
+        # Create model (3 classes: Open, Short, Resistive)
+        model = resnet18(weights=None)
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, 3)
+        
+        # Load weights
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        model = model.to(device)
+        model.eval()
+        
+        classifier_model = model
+        print(f"✓ Classifier model loaded successfully (device: {device})")
+        return True
+    except Exception as e:
+        print(f"✗ Error loading classifier model: {e}")
+        return False
+
+def load_distance_regressor():
+    """Load the hybrid distance regression model"""
+    global distance_regressor, meta_ct
+    
+    try:
+        lazy_import_torchvision()
+        import joblib
+        
+        # Load the distance regressor model
+        regressor_path = os.path.join('models', 'hybrid_distance_regressor.pth')
+        if not os.path.exists(regressor_path):
+            raise FileNotFoundError(f"Distance regressor not found at {regressor_path}")
+        
+        # Load meta transformer for preprocessing
+        meta_ct_path = os.path.join('models', 'meta_ct.joblib')
+        if not os.path.exists(meta_ct_path):
+            raise FileNotFoundError(f"Meta transformer not found at {meta_ct_path}")
+        
+        # Create hybrid model architecture (1D CNN + metadata fusion)
+        # Based on actual model weights:
+        # - cnn.0: Conv1d(1, 32, kernel_size=7)
+        # - cnn.3: Conv1d(32, 64, kernel_size=5)
+        # - cnn.6: Conv1d(64, 128, kernel_size=3)
+        # - head.0: Linear(132, 64)  <- 128 CNN features + 4 metadata features
+        # - head.2: Linear(64, 1)
+        class HybridDistanceRegressor(nn.Module):
+            def __init__(self):
+                super(HybridDistanceRegressor, self).__init__()
+                # 1D CNN for waveform features
+                self.cnn = nn.Sequential(
+                    nn.Conv1d(1, 32, kernel_size=7, padding=3),  # cnn.0
+                    nn.ReLU(),
+                    nn.MaxPool1d(2),
+                    nn.Conv1d(32, 64, kernel_size=5, padding=2),  # cnn.3
+                    nn.ReLU(),
+                    nn.MaxPool1d(2),
+                    nn.Conv1d(64, 128, kernel_size=3, padding=1),  # cnn.6
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool1d(1)  # Global average pooling -> 128 features
+                )
+                
+                # Regression head (CNN features + metadata)
+                self.head = nn.Sequential(
+                    nn.Linear(128 + 4, 64),  # head.0: 128 CNN + 4 metadata = 132
+                    nn.ReLU(),
+                    nn.Linear(64, 1)  # head.2: regression output
+                )
+            
+            def forward(self, waveform, metadata):
+                # waveform shape: (batch, 1, length)
+                # metadata shape: (batch, 4)
+                
+                # Extract CNN features
+                cnn_features = self.cnn(waveform)  # (batch, 128, 1)
+                cnn_features = cnn_features.squeeze(-1)  # (batch, 128)
+                
+                # Concatenate with metadata
+                combined = torch.cat([cnn_features, metadata], dim=1)  # (batch, 132)
+                
+                # Regression output
+                distance = self.head(combined)  # (batch, 1)
+                return distance
+        
+        # Load model
+        model = HybridDistanceRegressor()
+        model.load_state_dict(torch.load(regressor_path, map_location=device, weights_only=True))
+        model = model.to(device)
+        model.eval()
+        distance_regressor = model
         
         # Load metadata transformer
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore")
-            meta_ct = joblib.load("models/meta_ct.joblib")
-        print("✓ Metadata transformer loaded")
+        try:
+            meta_ct = joblib.load(meta_ct_path)
+            print(f"✓ Distance regressor loaded successfully (device: {device})")
+            print(f"  Model uses 1D CNN + metadata fusion (VF, Z0, V, F)")
+        except Exception as e:
+            print(f"✗ Error loading meta_ct.joblib: {e}")
+            print(f"  This will prevent distance prediction from working")
+            distance_regressor = None
+            meta_ct = None
+            return False
         
-        # Load regressor
-        meta_dim = meta_ct.transform(pd.DataFrame([[0, 0, 0, 0]], columns=["vf", "z0", "V", "F"])).shape[1]
-        regressor_model = HybridRegressor(meta_dim).to(device)
-        regressor_model.load_state_dict(
-            torch.load("models/hybrid_distance_regressor.pth", map_location=device, weights_only=False)
-        )
-        regressor_model.eval()
-        print("✓ Regressor model loaded")
-        print("="*50)
-        print("✓ ALL MODELS LOADED SUCCESSFULLY!")
-        print("="*50)
-        
-    except FileNotFoundError as e:
-        print(f"\n⚠️  Model files not found: {e}")
-        print("Please add your trained models to the 'models/' folder")
-        print("API will run with limited functionality\n")
+        return True
     except Exception as e:
-        print(f"\n⚠️  Could not load models: {e}")
-        print("API will run with fallback mode\n")
+        print(f"✗ Error loading distance regressor: {e}")
+        print(f"   Distance prediction will be disabled")
+        return False
 
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
 
+@app.on_event("startup")
+async def startup_event():
+    """Load models on startup"""
+    print("\n" + "="*60)
+    print("TDR FAULT CLASSIFICATION BACKEND - STARTING UP")
+    print("="*60)
+    
+    classifier_success = load_classifier_model()
+    regressor_success = load_distance_regressor()
+    
+    if not classifier_success:
+        print("\n⚠ WARNING: Classifier model failed to load!")
+        print("API will start but fault classification will fail.\n")
+    
+    if not regressor_success:
+        print("\n⚠ WARNING: Distance regressor failed to load!")
+        print("Distance prediction will be disabled (fault classification still works).\n")
+    
+    if classifier_success and regressor_success:
+        print("\n✓ All systems ready!")
+        print("="*60 + "\n")
+
 @app.get("/")
 async def root():
+    """Health check endpoint"""
     return {
-        "message": "TDR Cable Fault Detection API",
         "status": "running",
-        "models": {
-            "classifier": classifier_model is not None,
-            "regressor": regressor_model is not None,
-            "metadata_transformer": meta_ct is not None
-        }
+        "message": "TDR Fault Classification API",
+        "classifier_loaded": classifier_model is not None,
+        "regressor_loaded": distance_regressor is not None,
+        "device": device
     }
 
-@app.post("/api/analyze-tdr")
-async def analyze_tdr(
+@app.post("/predict")
+async def predict(
     file: UploadFile = File(...),
-    velocityFactor: float = Form(...),
-    characteristicImpedance: float = Form(...)
+    velocityFactor: float = Form(0.67),
+    characteristicImpedance: float = Form(50.0)
 ):
-    """Main TDR analysis endpoint"""
+    """
+    Perform fault classification and distance prediction on uploaded TDR data
+    
+    Args:
+        file: CSV file with TDR waveform data
+        velocityFactor: Velocity factor (VF) of the cable (default: 0.67, range 0-1)
+        characteristicImpedance: Characteristic impedance Z0 in Ohms (default: 50)
+    
+    Returns: fault type classification, distance (if fault detected), and model outputs
+    """
     try:
-        # Validate inputs and ensure finite numbers
-        try:
-            velocityFactor = float(velocityFactor)
-            characteristicImpedance = float(characteristicImpedance)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid numeric parameters")
-
-        # Avoid divide-by-zero and negative values
-        if velocityFactor <= 0:
-            velocityFactor = 1e-6
-        if characteristicImpedance <= 0:
-            characteristicImpedance = 50.0
+        # Check if classifier model is loaded
+        if classifier_model is None:
+            raise HTTPException(status_code=500, detail="Classifier model not loaded")
         
-        # Get filename for hardcoded demo values
-        filename = file.filename.lower() if file.filename else ""
+        # Read and parse CSV (returns time and voltage arrays)
+        file_content = await file.read()
+        time_data, voltage_data = clean_and_load_csv(file_content)
         
-        # Read and parse CSV
-        content = await file.read()
-        time, voltage = clean_and_load_csv(content)
+        if len(voltage_data) == 0:
+            raise HTTPException(status_code=400, detail="No valid data in CSV file")
         
-        if time is None or voltage is None:
-            raise HTTPException(status_code=400, detail="Invalid CSV file format")
+        # Convert CSV waveform to image (this is what the model sees!)
+        # Training: Waveform → Image → ResNet18 → Classification
+        img = csv_to_image(time_data, voltage_data, target_size=(224, 224))
         
-        # Generate waveform image
-        img = csv_to_image(time, voltage)
-        if img is None:
-            raise HTTPException(status_code=400, detail="Failed to create waveform image")
+        # Prepare image for classification (MUST match training transform exactly)
+        lazy_import_torchvision()
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # Ensure exact size
+            transforms.ToTensor(),          # [0,1] range - NO normalization if training didn't use it
+        ])
         
-        img_base64 = image_to_base64(img)
+        img_tensor = transform(img).unsqueeze(0).to(device)
         
-        # Classify fault type using ResNet18
-        fault_type = "Open"
-        if classifier_model is not None:
-            img_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor()
-            ])
-            x_img = img_transform(img).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                logits = classifier_model(x_img)
-                cls_id = int(torch.argmax(logits, dim=1).item())
-                id2label = {0: "Open", 1: "Short", 2: "Resistive"}
-                fault_type = id2label[cls_id]
+        # ============================================================================
+        # STEP 1: FAULT CLASSIFICATION
+        # ============================================================================
+        with torch.no_grad():
+            outputs = classifier_model(img_tensor)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+            confidence_scores = probabilities[0].cpu().numpy()
+            _, predicted = torch.max(outputs, 1)
+            predicted_class = predicted.item()
         
-        # Prepare response - only faultType initially
-        response = {
-            "faultType": fault_type,
-            "waveform": {
-                "time": (time * 1e9).tolist(),  # Convert to nanoseconds
-                "voltage": voltage.tolist()
-            },
-            "waveformImage": img_base64
+        # Debug logging
+        print(f"\n{'='*60}")
+        print(f"DEBUG: Classification Results")
+        print(f"{'='*60}")
+        print(f"Raw logits: {outputs[0].cpu().tolist()}")
+        print(f"Softmax probabilities: {confidence_scores.tolist()}")
+        print(f"Predicted class: {predicted_class}")
+        print(f"Max probability: {confidence_scores[predicted_class]:.4f}")
+        print(f"{'='*60}\n")
+        
+        # Map prediction to fault type
+        # Model outputs: 0=Open, 1=Short, 2=Resistive
+        # UI expects: "No fault", "Short Circuit", "Resistive Fault"
+        fault_mapping = {
+            0: "No fault",           # Open circuit = No fault
+            1: "Short Circuit",      # Short circuit
+            2: "Resistive Fault"     # Resistive fault
         }
         
-        # If NOT Open, calculate distance and deltaT
-        if fault_type != "Open":
-            # Hardcoded demo values for specific files
-            if "temp1" in filename:
-                distance_pred = 0.5440
-                vf_override = 0.65
-            elif "temp2" in filename:
-                distance_pred = 1.8632
-                vf_override = 0.608
-            elif "temp3" in filename:
-                distance_pred = 1.8803
-                vf_override = 0.608
-            elif regressor_model is not None and meta_ct is not None:
-                # Use ML model prediction
-                try:
-                    sig = process_waveform(time, voltage, target_length=2048)
-                    x_sig = torch.tensor(sig).unsqueeze(0).unsqueeze(0).to(device)
-                    
-                    meta_row = pd.DataFrame([{
-                        "vf": velocityFactor,
-                        "z0": characteristicImpedance,
-                        "V": 5.0,
-                        "F": 1000.0
-                    }])
-                    x_meta = torch.tensor(meta_ct.transform(meta_row).astype(np.float32)).to(device)
-                    
-                    with torch.no_grad():
-                        distance_pred = float(regressor_model(x_sig, x_meta).item())
-                    vf_override = velocityFactor
-                except Exception as e:
-                    print(f"Regression error: {e}")
-                    distance_pred = None
-                    vf_override = velocityFactor
-            else:
-                # No model and no hardcoded value
-                distance_pred = None
-                vf_override = velocityFactor
-            
-            # Add distance and deltaT to response if we have a prediction
-            if distance_pred is not None:
-                response["faultDistance"] = distance_pred
+        fault_type = fault_mapping.get(predicted_class, "Unknown")
+        
+        # ============================================================================
+        # STEP 2: DISTANCE PREDICTION (only if fault detected and regressor loaded)
+        # ============================================================================
+        distance_meters = None
+        delta_t = None
+        
+        if predicted_class != 0 and distance_regressor is not None and meta_ct is not None:
+            try:
+                import pandas as pd
                 
-                # Calculate deltaT using: deltaT = 2*d / (VF * speed_of_light)
+                # Prepare waveform for 1D CNN
+                # The model expects: (batch, 1, length) - 1D signal
+                preprocessed_voltage = preprocess_voltage(voltage_data)
+                waveform_tensor = torch.tensor(preprocessed_voltage, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+                # Shape: (1, 1, num_samples)
+                
+                # Prepare metadata features for regressor
+                # Features: [vf, z0, V, F] - voltage and frequency might be in filename
+                # For now, use defaults (you can extract from filename later)
+                voltage = 3.0  # Default voltage
+                frequency = 100.0  # Default frequency in kHz
+                
+                # Create metadata dataframe
+                metadata_df = pd.DataFrame([[
+                    velocityFactor,
+                    characteristicImpedance,
+                    voltage,
+                    frequency
+                ]], columns=['vf', 'z0', 'V', 'F'])
+                
+                # Transform metadata using the scaler
+                metadata_transformed = meta_ct.transform(metadata_df)
+                metadata_tensor = torch.tensor(metadata_transformed, dtype=torch.float32).to(device)
+                # Shape: (1, 4)
+                
+                # Predict distance
+                with torch.no_grad():
+                    distance_pred = distance_regressor(waveform_tensor, metadata_tensor)
+                    distance_meters = float(distance_pred.item())
+                
+                # Calculate delta_t (round-trip time)
+                # delta_t = 2 * distance / (VF * c)
+                # where c = 3e8 m/s (speed of light)
                 speed_of_light = 3e8  # m/s
-                response["deltaT"] = float((2 * distance_pred) / (vf_override * speed_of_light))
+                delta_t = (2 * distance_meters) / (velocityFactor * speed_of_light)
+                delta_t_ns = delta_t * 1e9  # Convert to nanoseconds
+                
+                print(f"✓ Distance prediction: {distance_meters:.2f} meters")
+                print(f"  Delta-T: {delta_t_ns:.2f} ns")
+                
+            except Exception as e:
+                print(f"⚠ Distance prediction failed: {e}")
+                distance_meters = None
+                delta_t = None
+        elif predicted_class != 0 and distance_regressor is None:
+            print(f"⚠ Distance prediction skipped: Regressor not loaded")
+        
+        # Generate plot for display (with time axis)
+        plot_data = get_plot_base64(time_data, voltage_data)
+        
+        # Prepare detailed response (matching test code format)
+        response = {
+            "faultType": fault_type,
+            "distance": distance_meters,  # Will be null if no fault or regressor not loaded
+            "deltaT": delta_t,  # Round-trip time in seconds (null if no distance)
+            "plotData": plot_data,
+            "modelOutput": {
+                "predicted_class": int(predicted_class),
+                "predicted_fault_type": fault_type,
+                "confidence_scores": {
+                    "No fault (Open)": float(confidence_scores[0]),
+                    "Short Circuit": float(confidence_scores[1]),
+                    "Resistive Fault": float(confidence_scores[2])
+                },
+                "raw_logits": outputs[0].cpu().tolist(),
+                "model_info": {
+                    "device": str(device),
+                    "input_shape": list(img_tensor.shape),
+                    "num_samples": len(voltage_data),
+                    "time_range": f"{time_data[0]:.6e} to {time_data[-1]:.6e} seconds"
+                }
+            }
+        }
+        
+        print(f"✓ Classification: {fault_type} (class {predicted_class})")
+        print(f"  Confidence: {confidence_scores[predicted_class]:.2%}")
         
         return JSONResponse(content=response)
         
-    except HTTPException:
-        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        print(f"Analysis error: {e}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "models_loaded": {
-            "classifier": classifier_model is not None,
-            "regressor": regressor_model is not None,
-            "metadata_transformer": meta_ct is not None
-        }
-    }
-
-# ============================================================================
-# MAIN
-# ============================================================================
+        print(f"✗ Prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n" + "="*60)
-    print("  TDR CABLE FAULT DETECTION API")
-    print("  PyTorch-powered Analysis System")
-    print("="*60 + "\n")
+    print("\nStarting server on http://localhost:8000")
+    print("API docs available at http://localhost:8000/docs\n")
     uvicorn.run(app, host="0.0.0.0", port=8000)

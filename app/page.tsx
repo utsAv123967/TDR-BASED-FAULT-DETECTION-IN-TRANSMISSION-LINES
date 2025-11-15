@@ -31,21 +31,26 @@ export default function Home() {
       formData.append('velocityFactor', velocityFactor);
       formData.append('characteristicImpedance', characteristicImpedance);
 
-      const response = await fetch('http://localhost:8000/api/analyze-tdr', {
+      const response = await fetch('http://localhost:8000/predict', {
         method: 'POST',
         body: formData,
       });
 
       const data = await response.json();
+      console.log('Backend response:', data);
 
       if (!response.ok) {
-        throw new Error(data.detail || 'Failed to analyze TDR data');
+        const errorMsg = typeof data.detail === 'string' 
+          ? data.detail 
+          : JSON.stringify(data.detail || data);
+        throw new Error(errorMsg || 'Failed to analyze TDR data');
       }
 
       setResults(data);
     } catch (err) {
       console.error('Analysis error:', err);
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      setError(errorMsg);
     } finally {
       setLoading(false);
     }
@@ -95,9 +100,18 @@ export default function Home() {
 
         {/* Results */}
         {results && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 gap-6">
             <ResultsDisplay results={results} />
-            <WaveformChart waveform={results.waveform} />
+            {results.plotData && (
+              <div className="glass-card p-6">
+                <h2 className="text-xl font-semibold text-white mb-4">TDR Waveform</h2>
+                <img 
+                  src={results.plotData} 
+                  alt="TDR Waveform" 
+                  className="w-full rounded-lg"
+                />
+              </div>
+            )}
           </div>
         )}
       </div>

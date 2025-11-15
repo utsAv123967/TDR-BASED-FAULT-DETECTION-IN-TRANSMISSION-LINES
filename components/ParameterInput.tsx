@@ -38,7 +38,7 @@ export default function ParameterInput({
           </label>
           <input
             type="number"
-            step="1"
+            step="0.1"
             min="0"
             value={characteristicImpedance}
             onChange={(e) => onCharacteristicImpedanceChange(e.target.value)}
